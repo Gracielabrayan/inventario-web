@@ -1,125 +1,107 @@
-import flet as ft
+import streamlit as st
 import mysql.connector
+import pandas as pd
+import plotly.express as px
 import bcrypt
-import os
-from dotenv import load_dotenv
 
-# --- CONFIGURACIÓN ---
-load_dotenv()
-BG_MAIN = "#0b0e14"
-BG_CARD = "#151921"
-ACCENT = "#00f2ff"
-TEXT_MAIN = "#e0e6ed"
-DANGER = "#c40a0a"
+# Configuración de la página (Esto tiene que ser lo primero)
+st.set_page_config(page_title="IT INVENTORY PRO", layout="wide")
 
-# --- LÓGICA DE BASE DE DATOS (Se mantiene igual que en tu script original) ---
+# Función de conexión usando st.secrets (Para Streamlit Cloud)
 def conectar():
     return mysql.connector.connect(
-        host=os.getenv("DB_HOST"), 
-        user=os.getenv("DB_USER"), 
-        password=os.getenv("DB_PASS"), 
-        database=os.getenv("DB_NAME"),
-        port=os.getenv("DB_PORT")
+        host=st.secrets["DB_HOST"],
+        user=st.secrets["DB_USER"],
+        password=st.secrets["DB_PASS"],
+        database=st.secrets["DB_NAME"],
+        port=int(st.secrets["DB_PORT"]),
+        connect_timeout=20
     )
 
-def obtener_resumen_db():
+# Estado de autenticación
+if 'auth' not in st.session_state:
+    st.session_state['auth'] = False
+
+# --- PANTALLA DE LOGIN ---
+if not st.session_state['auth']:
+    col_a, col_b, col_c = st.columns([1, 1.2, 1])
+    with col_b:
+        st.write("")
+        with st.container(border=True):
+            st.markdown("<h2 style='text-align: center;'>🔐 Acceso al Sistema</h2>", unsafe_allow_html=True)
+            user_input = st.text_input("Usuario")
+            pw_input = st.text_input("Clave", type="password")
+            
+            if st.button("ENTRAR", use_container_width=True, type="primary"):
+                try:
+                    conn = conectar()
+                    cursor = conn.cursor(dictionary=True)
+                    # Buscamos al usuario en la tabla
+                    cursor.execute("SELECT password FROM usuarios WHERE usuario = %s", (user_input,))
+                    res = cursor.fetchone()
+                    conn.close()
+                    
+                    if res and bcrypt.checkpw(pw_input.encode('utf-8'), res['password'].encode('utf-8')):
+                        st.session_state['auth'] = True
+                        st.rerun()
+                    else: 
+                        st.error("Usuario o clave incorrectos")
+                except Exception as e: 
+                    st.error(f"Error de conexión: {e}")
+
+# --- DASHBOARD (Solo si está autenticado) ---
+else:
+    with st.sidebar:
+        st.title("IT Admin")
+        st.write(f"Conectado a: {st.secrets['DB_NAME']}")
+        if st.button("Cerrar Sesión", use_container_width=True):
+            st.session_state['auth'] = False
+            st.rerun()
+
     try:
-        conn = conectar(); cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM resumen_relevamiento")
-        datos = cursor.fetchall(); conn.close()
-        return datos
-    except: return []
-
-# --- INTERFAZ PRINCIPAL ---
-def main(page: ft.Page):
-    page.title = "IT INVENTORY SYSTEM v3.0"
-    page.bgcolor = BG_MAIN
-    page.theme_mode = ft.ThemeMode.DARK
-    page.window_width = 1000
-    page.window_height = 800
-
-    def mostrar_dashboard(user_name):
-        page.clean()
+        conn = conectar()
         
-        # Pestaña de Estadísticas (Equivalente a tu gráfico de barras)
-        def build_stats():
-            datos = obtener_resumen_db()
-            total = sum(d['Total'] for d in datos)
-            
-            # Generamos las barras usando contenedores de Flet
-            barras = []
-            for d in datos:
-                # n=1851
-                altura = (d['Total'] / (max(i['Total'] for i in datos) or 1)) * 300
-                barras.append(
-                    ft.Column([
-                        ft.Text(f"n={d['Total']}", color=ACCENT, weight="bold"),
-                        ft.Container(bgcolor=ACCENT, width=80, height=altura, border_radius=5),
-                        ft.Text(d['Tipo'], color=TEXT_MAIN, size=12)
-                    ], horizontal_alignment="center", alignment="end")
-                )
-
-            return ft.Column([
-                ft.Text("RESUMEN DE EQUIPOS POR TIPO", size=20, color=ACCENT, weight="bold"),
-                ft.Text(f"TOTAL DISPOSITIVOS: {total}", color="#00ff00"),
-                ft.Row(barras, alignment="center", spacing=50, vertical_alignment="end")
-            ], horizontal_alignment="center", spacing=30)
-
-        # Contenedor principal con Tabs (Equivalente a tu Notebook)
-        tabs = ft.Tabs(
-            selected_index=0,
-            animation_duration=300,
-            tabs=[
-                ft.Tab(text="TERMINAL_POS", icon=ft.icons.COMPUTER, content=ft.Container(ft.Text("Aquí va la tabla de POS", color=TEXT_MAIN), padding=20)),
-                ft.Tab(text="SCALE_NODES", icon=ft.icons.SETTINGS_INPUT_COMPONENT, content=ft.Container(ft.Text("Aquí va la tabla de Balanzas", color=TEXT_MAIN), padding=20)),
-                ft.Tab(text="ESTADÍSTICAS", icon=ft.icons.BAR_CHART, content=ft.Container(build_stats(), padding=40)),
-            ],
-            expand=1
-        )
-
-        page.add(
-            ft.Row([
-                ft.Text(f"OPERATOR: {user_name.upper()}", color="#00ff00", size=12),
-                ft.ElevatedButton("[ LOGOUT ]", color="white", bgcolor=DANGER, on_click=lambda _: page.go("/"))
-            ], alignment="spaceBetween"),
-            tabs
-        )
-        page.update()
-
-    # --- PANTALLA DE LOGIN ---
-    def login_click(e):
-        u = user_input.value
-        p = pass_input.value
+        # KPIs de las 1851 terminales y balanzas
+        t_pos = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_pos_2024", conn)['t'][0]
+        t_bal = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_balanzas_2024", conn)['t'][0]
         
-        try:
-            conn = conectar(); cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT password FROM usuarios WHERE usuario = %s", (u,))
-            res = cursor.fetchone(); conn.close()
+        st.title("📊 Dashboard de Relevamiento 2024")
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("TOTAL POS", f"{t_pos:,}")
+        c2.metric("TOTAL BALANZAS", f"{t_bal:,}")
+        c3.metric("EQUIPOS TOTALES", f"{t_pos + t_bal:,}")
+
+        tab1, tab2 = st.tabs(["🖥️ Terminales POS", "⚖️ Balanzas"])
+
+        with tab1:
+            st.subheader("Desglose por Hardware y Software")
+            # Consulta para el gráfico de barras
+            df_pos = pd.read_sql("""
+                SELECT `TIPO CAJA`, `SOFTWARE CAJA`, COUNT(*) AS Total 
+                FROM relevamiento_pos_2024 
+                GROUP BY 1, 2 
+                ORDER BY Total DESC
+            """, conn)
             
-            # Verificación con bcrypt igual que en tu código
-            if res and bcrypt.checkpw(p.encode('utf-8'), res['password'].encode('utf-8')):
-                mostrar_dashboard(u)
-            else:
-                page.snack_bar = ft.SnackBar(ft.Text("ACCESO DENEGADO"))
-                page.snack_bar.open = True
-        except Exception as ex:
-            print(f"Error: {ex}")
-        page.update()
+            df_pos["Config"] = df_pos["TIPO CAJA"] + " (" + df_pos["SOFTWARE CAJA"] + ")"
+            
+            fig_pos = px.bar(df_pos, x='Total', y='Config', orientation='h',
+                             color='SOFTWARE CAJA', text='Total',
+                             title="Distribución de Cajas",
+                             color_discrete_sequence=px.colors.qualitative.Bold)
+            
+            st.plotly_chart(fig_pos, use_container_width=True)
 
-    user_input = ft.TextField(label="OPERATOR_ID", border_color=ACCENT, on_submit=login_click)
-    pass_input = ft.TextField(label="SECURITY_KEY", password=True, can_reveal_password=True, border_color=ACCENT, on_submit=login_click)
+        with tab2:
+            st.subheader("Marcas de Balanzas")
+            df_bal = pd.read_sql("SELECT MARCA, COUNT(*) AS Total FROM relevamiento_balanzas_2024 GROUP BY 1", conn)
+            
+            fig_bal = px.pie(df_bal, values='Total', names='MARCA', 
+                             title='Participación por Marca', hole=.4)
+            st.plotly_chart(fig_bal, use_container_width=True)
 
-    page.add(
-        ft.Container(
-            content=ft.Column([
-                ft.Text("🔒 SYSTEM LOGIN", size=25, color=ACCENT, weight="bold"),
-                user_input, pass_input,
-                ft.ElevatedButton("[ AUTHORIZE ]", bgcolor=ACCENT, color=BG_MAIN, on_click=login_click, width=200)
-            ], horizontal_alignment="center", spacing=20),
-            padding=50, bgcolor=BG_CARD, border_radius=10, alignment=ft.alignment.center, width=400
-        )
-    )
-
-# Importante para Cloud Run: escuchar en el puerto 8080
-if __name__ == "__main__":
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=int(os.getenv("PORT", 8080)))
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"Error al cargar datos: {e}")
