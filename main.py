@@ -4,42 +4,58 @@ import pandas as pd
 import plotly.express as px
 import bcrypt
 
-# 1. Configuración de página
+# 1. Configuración de página (Debe ser la primera instrucción de Streamlit)
 st.set_page_config(page_title="IT INVENTORY PRO", layout="wide")
 
-# 2. Funciones con CACHÉ para optimizar velocidad
-@st.cache_resource
+# 2. Función de conexión ROBUSTA (Sin caché de recurso para evitar conexiones muertas)
 def obtener_conexion():
-    return mysql.connector.connect(
-        host=st.secrets["DB_HOST"],
-        user=st.secrets["DB_USER"],
-        password=st.secrets["DB_PASS"],
-        database=st.secrets["DB_NAME"],
-        port=int(st.secrets["DB_PORT"]),
-        connect_timeout=15
-    )
+    try:
+        conn = mysql.connector.connect(
+            host=st.secrets["DB_HOST"],
+            user=st.secrets["DB_USER"],
+            password=st.secrets["DB_PASS"],
+            database=st.secrets["DB_NAME"],
+            port=int(st.secrets["DB_PORT"]),
+            connect_timeout=20,
+            autocommit=True
+        )
+        return conn
+    except Exception as e:
+        st.error(f"Error crítico al conectar con la base de datos: {e}")
+        return None
 
-@st.cache_data(ttl=600)
+# 3. Carga de datos con Caché (Se guarda el resultado, no la conexión)
+@st.cache_data(ttl=300) # Se actualiza cada 5 minutos
 def cargar_datos_dashboard():
     conn = obtener_conexion()
+    if conn is None:
+        return None, None, None, None
     
-    # KPIs
-    t_pos = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_pos_2024", conn)['t'][0]
-    t_bal = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_balanzas_2024", conn)['t'][0]
-    
-    # Datos para gráficos (Ordenados por Total en la query)
-    df_pos = pd.read_sql("""
-        SELECT `TIPO CAJA`, `SOFTWARE CAJA`, COUNT(*) AS Total 
-        FROM relevamiento_pos_2024 
-        GROUP BY 1, 2 
-        ORDER BY Total ASC
-    """, conn)
-    
-    df_bal = pd.read_sql("SELECT MARCA, COUNT(*) AS Total FROM relevamiento_balanzas_2024 GROUP BY 1", conn)
-    
-    return t_pos, t_bal, df_pos, df_bal
+    try:
+        # KPIs
+        t_pos = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_pos_2024", conn)['t'][0]
+        t_bal = pd.read_sql("SELECT COUNT(*) as t FROM relevamiento_balanzas_2024", conn)['t'][0]
+        
+        # Datos para gráfico de POS
+        df_pos = pd.read_sql("""
+            SELECT `TIPO CAJA`, `SOFTWARE CAJA`, COUNT(*) AS Total 
+            FROM relevamiento_pos_2024 
+            GROUP BY 1, 2 
+            ORDER BY Total ASC
+        """, conn)
+        
+        # Datos para gráfico de Balanzas
+        df_bal = pd.read_sql("SELECT MARCA, COUNT(*) AS Total FROM relevamiento_balanzas_2024 GROUP BY 1", conn)
+        
+        return t_pos, t_bal, df_pos, df_bal
+    except Exception as e:
+        st.error(f"Error al leer tablas: {e}")
+        return None, None, None, None
+    finally:
+        if conn and conn.is_connected():
+            conn.close() # CERRAMOS para liberar el cupo en Clever Cloud
 
-# 3. Lógica de Autenticación
+# 4. Estado de sesión para Login
 if 'auth' not in st.session_state:
     st.session_state['auth'] = False
 
@@ -54,74 +70,71 @@ if not st.session_state['auth']:
             pw_input = st.text_input("Clave", type="password")
             
             if st.button("INGRESAR", use_container_width=True, type="primary"):
-                try:
-                    conn = obtener_conexion()
-                    cursor = conn.cursor(dictionary=True)
-                    cursor.execute("SELECT password FROM usuarios WHERE usuario = %s", (user_input,))
-                    res = cursor.fetchone()
-                    
-                    if res and bcrypt.checkpw(pw_input.encode('utf-8'), res['password'].encode('utf-8')):
-                        st.session_state['auth'] = True
-                        st.rerun()
-                    else: 
-                        st.error("Credenciales incorrectas")
-                except Exception as e:
-                    st.error(f"Error de conexión: {e}")
+                conn_login = obtener_conexion()
+                if conn_login:
+                    try:
+                        cursor = conn_login.cursor(dictionary=True)
+                        cursor.execute("SELECT password FROM usuarios WHERE usuario = %s", (user_input,))
+                        res = cursor.fetchone()
+                        
+                        if res and bcrypt.checkpw(pw_input.encode('utf-8'), res['password'].encode('utf-8')):
+                            st.session_state['auth'] = True
+                            st.rerun()
+                        else: 
+                            st.error("Usuario o clave incorrectos")
+                    finally:
+                        conn_login.close()
 
-# --- DASHBOARD PRINCIPAL ---
+# --- DASHBOARD ---
 else:
     with st.sidebar:
         st.title("IT Admin")
-        st.info(f"Base: {st.secrets['DB_NAME']}")
+        st.info(f"Conectado a: {st.secrets['DB_NAME']}")
         if st.button("Cerrar Sesión", use_container_width=True):
             st.session_state['auth'] = False
+            st.cache_data.clear() # Limpiamos caché al salir
             st.rerun()
 
-    try:
-        with st.spinner('Actualizando datos...'):
-            t_pos, t_bal, df_pos, df_bal = cargar_datos_dashboard()
-        
+    # Carga de datos
+    t_pos, t_bal, df_pos, df_bal = cargar_datos_dashboard()
+
+    if t_pos is not None:
         st.title("📊 Relevamiento IT 2024")
         
-        # Métricas principales
+        # Métricas
         m1, m2, m3 = st.columns(3)
         m1.metric("TERMINALES POS", f"{t_pos:,}")
         m2.metric("BALANZAS", f"{t_bal:,}")
         m3.metric("TOTAL EQUIPOS", f"{t_pos + t_bal:,}")
 
-        tab_pos, tab_bal = st.tabs(["🖥️ Detalle POS", "⚖️ Detalle Balanzas"])
+        tab1, tab2 = st.tabs(["🖥️ Detalle POS", "⚖️ Detalle Balanzas"])
 
-        with tab_pos:
-            # Preparación de etiquetas
+        with tab1:
             df_pos["Config"] = df_pos["TIPO CAJA"] + " (" + df_pos["SOFTWARE CAJA"] + ")"
-            
-            # Creación del gráfico
             fig_pos = px.bar(df_pos, x='Total', y='Config', orientation='h',
                              color='SOFTWARE CAJA', text='Total',
                              title="Distribución por Hardware/Software",
                              height=600,
-                             color_discrete_sequence=px.colors.qualitative.Pastel)
+                             color_discrete_sequence=px.colors.qualitative.Bold)
 
-            # AJUSTE DE NÚMEROS: Horizontales, afuera y legibles
+            # Ajuste de etiquetas horizontales y afuera
             fig_pos.update_traces(
                 textposition='outside', 
-                textangle=0,            # Fuerza posición horizontal
-                cliponaxis=False,       # Evita que se corten los números
-                textfont=dict(size=14)  # Aumenta un poco el tamaño
+                textangle=0, 
+                cliponaxis=False,
+                textfont=dict(size=14, color="white")
             )
-
-            # Ordenar para que la barra más larga esté ARRIBA
-            fig_pos.update_layout(
-                yaxis={'categoryorder':'total ascending'},
-                margin=dict(l=20, r=50, t=50, b=20) # Espacio para que el número no se salga del borde
-            )
+            
+            # Ordenar: Más grande arriba
+            fig_pos.update_layout(yaxis={'categoryorder':'total ascending'})
             
             st.plotly_chart(fig_pos, use_container_width=True)
 
-        with tab_bal:
+        with tab2:
             fig_bal = px.pie(df_bal, values='Total', names='MARCA', 
                              title='Market Share de Balanzas', hole=.4)
             st.plotly_chart(fig_bal, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error al cargar el dashboard: {e}")
+    else:
+        st.warning("No se pudo cargar la información. Reintentá en unos segundos.")
+        if st.button("Reintentar ahora"):
+            st.rerun()
